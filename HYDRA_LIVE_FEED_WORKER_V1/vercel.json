@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "crons": [
+    {
+      "path": "/api/hydra-live-feed-worker?secret=$HYDRA_WORKER_SECRET",
+      "schedule": "0 */4 * * *"
+    }
+  ]
+}
