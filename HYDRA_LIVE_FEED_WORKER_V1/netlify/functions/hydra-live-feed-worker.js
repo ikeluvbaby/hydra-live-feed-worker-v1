@@ -3,11 +3,14 @@
  * Browserbase + OpenAI -> Hydra live leverage signal feed.
  */
 
-import fs from "node:fs";
-import crypto from "node:crypto";
-import Browserbase from "@browserbasehq/sdk";
-import { chromium } from "playwright-core";
-import OpenAI from "openai";
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const BrowserbaseModule = require("@browserbasehq/sdk");
+const Browserbase = BrowserbaseModule.default || BrowserbaseModule;
+const { chromium } = require("playwright-core");
+const OpenAIModule = require("openai");
+const OpenAI = OpenAIModule.default || OpenAIModule;
 
 const DEFAULT_KEYWORDS = [
   "need", "asap", "urgent", "today", "tomorrow", "this week", "denied", "declined",
@@ -64,7 +67,7 @@ function parseTargets() {
     if (!Array.isArray(parsed)) throw new Error("HYDRA_FEED_TARGETS_JSON must be a JSON array.");
     return parsed.filter((t) => t.enabled !== false);
   }
-  const configPath = new URL("../../hydra-feeds.config.example.json", import.meta.url);
+  const configPath = path.join(process.cwd(), "hydra-feeds.config.example.json");
   if (fs.existsSync(configPath)) return JSON.parse(fs.readFileSync(configPath, "utf8")).filter((t) => t.enabled !== false);
   return [];
 }
@@ -243,7 +246,7 @@ function configCheck() {
   };
 }
 
-export async function handler(event) {
+exports.handler = async function(event) {
   try {
     const params = event.queryStringParameters || {};
     const headers = event.headers || {};
@@ -267,7 +270,7 @@ export async function handler(event) {
       stack: process.env.NODE_ENV === "development" ? err.stack : undefined
     });
   }
-}
+};
 
 function jsonResponse(statusCode, body) {
   return {

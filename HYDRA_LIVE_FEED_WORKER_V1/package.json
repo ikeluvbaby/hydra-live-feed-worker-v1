@@ -1,19 +1,15 @@
 {
   "name": "hydra-live-feed-worker-v1",
-  "version": "1.0.0",
+  "version": "1.2.0-netlify-cjs",
   "private": true,
-  "type": "module",
   "scripts": {
-    "dev": "vercel dev",
-    "start:local": "node api/hydra-live-feed-worker.js --once",
-    "test:config": "node api/hydra-live-feed-worker.js --config-check"
+    "start:local": "node netlify/functions/hydra-live-feed-worker.js --once",
+    "test:config": "node netlify/functions/hydra-live-feed-worker.js --config-check"
   },
   "dependencies": {
     "@browserbasehq/sdk": "^2.0.0",
     "openai": "^6.0.0",
     "playwright-core": "^1.49.0"
   },
-  "devDependencies": {
-    "vercel": "^39.0.0"
-  }
+  "devDependencies": {}
 }
