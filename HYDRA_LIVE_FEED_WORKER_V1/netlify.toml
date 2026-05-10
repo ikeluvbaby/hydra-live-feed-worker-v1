@@ -1,3 +1,0 @@
-[build]
-base = "HYDRA_LIVE_FEED_WORKER_V1"
-functions = "netlify/functions"
