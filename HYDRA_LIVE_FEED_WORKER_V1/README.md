@@ -85,3 +85,4 @@ The worker sends multiple compatible aliases:
 ## Production rule
 
 Start with `HYDRA_DRY_RUN=true`. When logs look clean, set `HYDRA_DRY_RUN=false`.
+Initial Vercel deployment trigger.
