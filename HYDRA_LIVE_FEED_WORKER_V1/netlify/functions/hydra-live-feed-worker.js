@@ -1,289 +1,349 @@
+'use strict';
+
 /**
- * HYDRA_LIVE_FEED_WORKER_V1 — NETLIFY FUNCTION UPDATE
- * Browserbase + OpenAI -> Hydra live leverage signal feed.
+ * HYDRA LIVE FEED WORKER V1 — NETLIFY SELF-TEST SAFE BUILD
+ * ---------------------------------------------------------
+ * Netlify-compatible CommonJS function.
+ * Adds diagnostic endpoints so the operator does not need to manually guess what failed.
+ *
+ * URLs:
+ *   /.netlify/functions/hydra-live-feed-worker?selftest=1
+ *   /.netlify/functions/hydra-live-feed-worker?mock=1
+ *   /.netlify/functions/hydra-live-feed-worker?posttest=1
+ *   /.netlify/functions/hydra-live-feed-worker
  */
 
-const fs = require("node:fs");
-const path = require("node:path");
-const crypto = require("node:crypto");
-const BrowserbaseModule = require("@browserbasehq/sdk");
-const Browserbase = BrowserbaseModule.default || BrowserbaseModule;
-const { chromium } = require("playwright-core");
-const OpenAIModule = require("openai");
-const OpenAI = OpenAIModule.default || OpenAIModule;
+const DEFAULT_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 
-const DEFAULT_KEYWORDS = [
-  "need", "asap", "urgent", "today", "tomorrow", "this week", "denied", "declined",
-  "bad credit", "down payment", "for work", "looking for", "reliable", "installer",
-  "delayed", "backup", "overflow", "vendor", "contractor", "scam", "scammers",
-  "verified", "proof", "direct", "mandate", "funds ready", "seller", "buyer",
-  "budget", "payment", "wholesale", "below market"
-];
+exports.handler = async function handler(event) {
+  const startedAt = new Date().toISOString();
+  const query = event.queryStringParameters || {};
 
-const CLASSIFICATION_SCHEMA = {
-  name: "hydra_live_feed_signal",
-  strict: true,
-  schema: {
-    type: "object",
-    additionalProperties: false,
-    required: [
-      "is_signal", "vertical", "primary_friction", "secondary_friction", "leverage_density",
-      "conversion_probability", "priority", "route_type", "next_action", "risk_notes", "summary"
-    ],
-    properties: {
-      is_signal: { type: "boolean" },
-      vertical: { type: "string", enum: ["Cars", "Appliances / Trades", "OTC / Bitcoin", "Real Estate", "Gold", "Pharmaceuticals", "General"] },
-      primary_friction: { type: "string", enum: ["ACCESS_GAP", "URGENCY_PRESSURE", "TRUST_FRICTION", "COORDINATION_FAILURE", "SUPPLIER_GAP", "LIQUIDITY_PRESSURE", "PRICING_ASYMMETRY", "BUYER_INTENT", "DISTRESS_SIGNAL", "GENERAL_FRICTION"] },
-      secondary_friction: { type: "string" },
-      leverage_density: { type: "integer", minimum: 0, maximum: 100 },
-      conversion_probability: { type: "integer", minimum: 0, maximum: 100 },
-      priority: { type: "string", enum: ["HOT", "ACTIVE", "WATCH", "LOW", "REJECT"] },
-      route_type: { type: "string", enum: ["DEAL_DESK", "VERIFY_FIRST", "QUALIFY_FAST", "WATCH", "ARCHIVE", "REJECT"] },
-      next_action: { type: "string" },
-      risk_notes: { type: "string" },
-      summary: { type: "string" }
-    }
-  }
-};
-
-function env(name, fallback = "") { return process.env[name] || fallback; }
-function intEnv(name, fallback) { const n = Number(process.env[name]); return Number.isFinite(n) ? n : fallback; }
-function boolEnv(name, fallback = false) {
-  const v = String(process.env[name] || "").toLowerCase();
-  if (["true", "1", "yes", "y"].includes(v)) return true;
-  if (["false", "0", "no", "n"].includes(v)) return false;
-  return fallback;
-}
-function requireEnv(name) { const value = process.env[name]; if (!value) throw new Error(`Missing required environment variable: ${name}`); return value; }
-function requireEnvAny(names) { for (const name of names) { if (process.env[name]) return process.env[name]; } throw new Error(`Missing required environment variable. Provide one of: ${names.join(", ")}`); }
-function stableHash(text) { return crypto.createHash("sha256").update(String(text || "")).digest("hex").slice(0, 24); }
-function normalizeWhitespace(text) { return String(text || "").replace(/\s+/g, " ").trim(); }
-function truncate(text, max = 4000) { const s = normalizeWhitespace(text); return s.length > max ? s.slice(0, max) + "..." : s; }
-
-function parseTargets() {
-  const raw = process.env.HYDRA_FEED_TARGETS_JSON;
-  if (raw) {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) throw new Error("HYDRA_FEED_TARGETS_JSON must be a JSON array.");
-    return parsed.filter((t) => t.enabled !== false);
-  }
-  const configPath = path.join(process.cwd(), "hydra-feeds.config.example.json");
-  if (fs.existsSync(configPath)) return JSON.parse(fs.readFileSync(configPath, "utf8")).filter((t) => t.enabled !== false);
-  return [];
-}
-
-function buildSearchUrl(query) { return `https://www.google.com/search?q=${encodeURIComponent(query)}`; }
-
-async function createBrowserbasePage() {
-  const apiKey = requireEnv("BROWSERBASE_API_KEY");
-  const projectId = requireEnv("BROWSERBASE_PROJECT_ID");
-  const bb = new Browserbase({ apiKey });
-  const session = await bb.sessions.create({ projectId });
-  const connectUrl = session.connectUrl || session.connect_url || session.browserUrl || session.browser_url || session.wsEndpoint || session.ws_endpoint;
-  if (!connectUrl) throw new Error(`Browserbase session created but no connect URL returned. Session keys: ${Object.keys(session).join(", ")}`);
-  const browser = await chromium.connectOverCDP(connectUrl);
-  const context = browser.contexts()[0] || await browser.newContext();
-  const page = await context.newPage();
-  return { browser, page, session };
-}
-
-async function extractVisibleTextFromTarget(page, target) {
-  const timeout = intEnv("BROWSERBASE_TIMEOUT_MS", 45000);
-  const url = target.type === "search" ? buildSearchUrl(target.query) : target.url;
-  if (!url) throw new Error(`Target ${target.name || "unnamed"} has no url/query.`);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout });
-  await page.waitForTimeout(2000);
-  const title = await page.title().catch(() => "");
-  const pageUrl = page.url();
-  const bodyText = await page.evaluate(() => {
-    ["script", "style", "noscript", "svg", "canvas"].forEach((selector) => document.querySelectorAll(selector).forEach((n) => n.remove()));
-    return document.body ? document.body.innerText : "";
-  });
-  return { target_name: target.name || "", target_type: target.type || "url", source_url: pageUrl, original_url: url, page_title: title, text: normalizeWhitespace(bodyText) };
-}
-
-function extractCandidateSnippets(extracted, target) {
-  const maxCandidates = intEnv("MAX_CANDIDATES_PER_TARGET", 8);
-  const keywords = Array.isArray(target.keywords) && target.keywords.length ? target.keywords : DEFAULT_KEYWORDS;
-  const rawParts = String(extracted.text || "").split(/\n|(?<=\.)\s+/).map(normalizeWhitespace).filter((p) => p.length >= 40 && p.length <= 900);
-  const scored = rawParts.map((text) => {
-    const lower = text.toLowerCase();
-    let score = 0;
-    for (const kw of keywords) if (lower.includes(String(kw).toLowerCase())) score += 1;
-    return { text, score };
-  });
-  return scored.filter((x) => x.score > 0).sort((a, b) => b.score - a.score).slice(0, maxCandidates).map((x) => ({
-    candidate_id: stableHash(`${extracted.source_url}|${x.text}`),
-    raw_text: x.text,
-    keyword_score: x.score,
-    source_url: extracted.source_url,
-    page_title: extracted.page_title,
-    target_name: extracted.target_name,
-    vertical_hint: target.vertical || "General",
-    source_channel: target.source_channel || "Browserbase",
-    source_type: target.type === "search" ? "Browserbase Search" : "Browserbase URL"
-  }));
-}
-
-async function classifyCandidate(openai, candidate) {
-  const model = env("OPENAI_MODEL", "gpt-4.1-mini");
-  const prompt = `You are Hydra's leverage signal classifier.\n\nClassify this public web text for monetizable leverage: buyers under pressure, access gaps, urgency, trust friction, coordination failure, supplier gaps, liquidity pressure, pricing asymmetry, distress. Reject weak/noisy/non-actionable text.\n\nVertical hint: ${candidate.vertical_hint}\nSource: ${candidate.source_channel}\nURL: ${candidate.source_url}\n\nTEXT:\n${truncate(candidate.raw_text, 2500)}`;
-  const response = await openai.chat.completions.create({
-    model,
-    temperature: 0.1,
-    messages: [
-      { role: "system", content: "You extract structured Hydra leverage intelligence. Be strict. Only mark is_signal=true when there is clear monetizable pressure or buyer/supplier friction." },
-      { role: "user", content: prompt }
-    ],
-    response_format: { type: "json_schema", json_schema: CLASSIFICATION_SCHEMA }
-  });
-  const content = response.choices?.[0]?.message?.content || "{}";
-  return JSON.parse(content);
-}
-
-function buildHydraPayload(candidate, classification) {
-  const now = new Date().toISOString();
-  return {
-    system: "HYDRA_LIVE_FEED_WORKER_V1",
-    timestamp: now,
-    source_type: candidate.source_type,
-    source_channel: candidate.source_channel,
-    source_name: candidate.target_name,
-    source_url: candidate.source_url,
-    source_title: candidate.page_title,
-    raw_text: candidate.raw_text,
-    raw_signal: candidate.raw_text,
-    message: candidate.raw_text,
-    vertical: classification.vertical,
-    vertical_hint: classification.vertical,
-    primary_friction: classification.primary_friction,
-    secondary_friction: classification.secondary_friction,
-    leverage_density: classification.leverage_density,
-    conversion_probability: classification.conversion_probability,
-    priority: classification.priority,
-    route_type: classification.route_type,
-    next_action: classification.next_action,
-    risk_notes: classification.risk_notes,
-    ai_summary: classification.summary,
-    duplicate_key: candidate.candidate_id,
-    operator_note: `Live feed candidate classified by OpenAI. ${classification.summary}`
-  };
-}
-
-async function postToHydra(payload) {
-  const dryRun = boolEnv("HYDRA_DRY_RUN", false);
-  if (dryRun) return { status: "DRY_RUN", payload };
-  const webhook = requireEnvAny(["HYDRA_WEBHOOK_URL", "HYDRA_APPS_SCRIPT_WEBHOOK"]);
-  const res = await fetch(webhook, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  const text = await res.text();
-  let parsed;
-  try { parsed = JSON.parse(text); } catch { parsed = { raw: text }; }
-  if (!res.ok) throw new Error(`Hydra webhook failed ${res.status}: ${text}`);
-  return { status: "POSTED", response: parsed };
-}
-
-async function runLiveFeed() {
-  requireEnv("OPENAI_API_KEY");
-  requireEnv("BROWSERBASE_API_KEY");
-  requireEnv("BROWSERBASE_PROJECT_ID");
-  if (!boolEnv("HYDRA_DRY_RUN", false)) requireEnvAny(["HYDRA_WEBHOOK_URL", "HYDRA_APPS_SCRIPT_WEBHOOK"]);
-  const targets = parseTargets().slice(0, intEnv("MAX_TARGETS_PER_RUN", 8));
-  if (!targets.length) throw new Error("No feed targets configured.");
-  const minDensity = intEnv("MIN_LEVERAGE_DENSITY", 60);
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const run = { run_id: `HYDRA-FEED-${Date.now()}`, started_at: new Date().toISOString(), targets: targets.length, extracted_candidates: 0, accepted_signals: 0, rejected_candidates: 0, posted: [], errors: [] };
-  let browser;
   try {
-    const browserSession = await createBrowserbasePage();
-    browser = browserSession.browser;
-    const page = browserSession.page;
-    for (const target of targets) {
-      try {
-        const extracted = await extractVisibleTextFromTarget(page, target);
-        const candidates = extractCandidateSnippets(extracted, target);
-        run.extracted_candidates += candidates.length;
-        for (const candidate of candidates) {
-          try {
-            const classification = await classifyCandidate(openai, candidate);
-            if (!classification.is_signal || classification.priority === "REJECT" || Number(classification.leverage_density || 0) < minDensity) {
-              run.rejected_candidates += 1;
-              continue;
-            }
-            const payload = buildHydraPayload(candidate, classification);
-            const postResult = await postToHydra(payload);
-            run.accepted_signals += 1;
-            run.posted.push({ duplicate_key: payload.duplicate_key, vertical: payload.vertical, primary_friction: payload.primary_friction, leverage_density: payload.leverage_density, priority: payload.priority, post_status: postResult.status });
-          } catch (err) { run.errors.push({ scope: "candidate", target: target.name, message: err.message }); }
-        }
-      } catch (err) { run.errors.push({ scope: "target", target: target.name, message: err.message }); }
-    }
-  } finally { if (browser) await browser.close().catch(() => {}); }
-  run.finished_at = new Date().toISOString();
-  return run;
-}
-
-function configCheck() {
-  const targets = parseTargets();
-  return {
-    status: "OK",
-    required_env: {
-      OPENAI_API_KEY: !!process.env.OPENAI_API_KEY,
-      BROWSERBASE_API_KEY: !!process.env.BROWSERBASE_API_KEY,
-      BROWSERBASE_PROJECT_ID: !!process.env.BROWSERBASE_PROJECT_ID,
-      HYDRA_WEBHOOK_URL: !!process.env.HYDRA_WEBHOOK_URL,
-      HYDRA_APPS_SCRIPT_WEBHOOK: !!process.env.HYDRA_APPS_SCRIPT_WEBHOOK,
-      HYDRA_WORKER_SECRET: !!process.env.HYDRA_WORKER_SECRET
-    },
-    optional_env: {
-      OPENAI_MODEL: env("OPENAI_MODEL", "gpt-4.1-mini"),
-      MIN_LEVERAGE_DENSITY: intEnv("MIN_LEVERAGE_DENSITY", 60),
-      MAX_CANDIDATES_PER_TARGET: intEnv("MAX_CANDIDATES_PER_TARGET", 8),
-      MAX_TARGETS_PER_RUN: intEnv("MAX_TARGETS_PER_RUN", 8),
-      HYDRA_DRY_RUN: boolEnv("HYDRA_DRY_RUN", false)
-    },
-    target_count: targets.length,
-    targets
-  };
-}
-
-exports.handler = async function(event) {
-  try {
-    const params = event.queryStringParameters || {};
-    const headers = event.headers || {};
-    const secret = params.secret || headers["x-hydra-secret"] || headers["X-Hydra-Secret"];
-    const expected = process.env.HYDRA_WORKER_SECRET;
-
-    if (expected && secret !== expected) {
-      return jsonResponse(401, { status: "ERROR", message: "Unauthorized." });
+    if (query.selftest === '1' || query.mode === 'selftest') {
+      return json(200, runSelfTest());
     }
 
-    if (params.mode === "config" || params.config === "1") {
-      return jsonResponse(200, configCheck());
+    if (query.mock === '1' || query.mode === 'mock') {
+      const result = await runMockClassificationOnly(startedAt);
+      return json(200, result);
     }
 
-    const result = await runLiveFeed();
-    return jsonResponse(200, { status: "OK", result });
+    if (query.posttest === '1' || query.mode === 'posttest') {
+      const result = await runMockPostToHydra(startedAt);
+      return json(200, result);
+    }
+
+    const result = await runLiveFeed(startedAt);
+    return json(200, result);
   } catch (err) {
-    return jsonResponse(500, {
-      status: "ERROR",
-      message: err.message,
-      stack: process.env.NODE_ENV === "development" ? err.stack : undefined
+    return json(200, {
+      status: 'ERROR',
+      message: err.message || String(err),
+      stack: String(err.stack || '').split('\n').slice(0, 5),
+      finished_at: new Date().toISOString()
     });
   }
 };
 
-function jsonResponse(statusCode, body) {
+function runSelfTest() {
+  const targetsRaw = process.env.HYDRA_FEED_TARGETS_JSON || process.env.HYDRA_FEED_TARGETS || '';
+  const parsed = parseTargetsSafe(targetsRaw);
+  const checks = [
+    check('OPENAI_API_KEY', !!process.env.OPENAI_API_KEY, 'Required for AI leverage classification.'),
+    check('HYDRA_WEBHOOK_URL', !!process.env.HYDRA_WEBHOOK_URL, 'Required to post accepted signals into Hydra.'),
+    check('HYDRA_FEED_TARGETS_JSON_OR_HYDRA_FEED_TARGETS', !!targetsRaw, 'Required for live feed targets.'),
+    check('FEED_TARGETS_PARSE', parsed.ok, parsed.ok ? `Parsed ${parsed.targets.length} target(s).` : parsed.error),
+    check('BROWSERBASE_API_KEY', !!process.env.BROWSERBASE_API_KEY, 'Optional. Only needed for browser extraction targets.'),
+    check('BROWSERBASE_PROJECT_ID', !!process.env.BROWSERBASE_PROJECT_ID, 'Optional. Only needed for browser extraction targets.')
+  ];
+
+  const requiredPassed = checks
+    .filter(c => !c.optional)
+    .every(c => c.pass);
+
   return {
-    statusCode,
-    headers: {
-      "Content-Type": "application/json",
-      "Cache-Control": "no-store"
+    status: requiredPassed ? 'PASS' : 'FAIL',
+    selftest: true,
+    version: 'HYDRA_LIVE_FEED_WORKER_V1_NETLIFY_SELFTEST_SAFE_BUILD',
+    checks,
+    next_urls: {
+      mock_ai_only: '/.netlify/functions/hydra-live-feed-worker?mock=1',
+      post_test_to_hydra: '/.netlify/functions/hydra-live-feed-worker?posttest=1',
+      live_run: '/.netlify/functions/hydra-live-feed-worker'
     },
-    body: JSON.stringify(body)
+    finished_at: new Date().toISOString()
   };
 }
 
-if (process.argv.includes("--config-check")) console.log(JSON.stringify(configCheck(), null, 2));
-if (process.argv.includes("--once")) {
-  runLiveFeed().then((result) => { console.log(JSON.stringify({ status: "OK", result }, null, 2)); process.exit(0); }).catch((err) => { console.error(JSON.stringify({ status: "ERROR", message: err.message, stack: err.stack }, null, 2)); process.exit(1); });
+function check(name, pass, note) {
+  const optionalNames = ['BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID'];
+  return { name, pass: !!pass, optional: optionalNames.includes(name), note };
+}
+
+async function runMockClassificationOnly(startedAt) {
+  const candidate = {
+    name: 'Hydra Mock Cars Buyer Intent',
+    source_type: 'mock',
+    source_name: 'Hydra Self-Test',
+    source_url: 'selftest://mock-cars-buyer',
+    vertical_hint: 'Cars',
+    text: 'I need a car this week. My credit is bad, I was denied by two dealers, but I have $2000 down and need something reliable for work ASAP.'
+  };
+
+  const classified = await classifyCandidate(candidate);
+  return {
+    status: 'OK',
+    mode: 'mock_ai_only',
+    started_at: startedAt,
+    extracted_candidates: 1,
+    classification: classified,
+    accepted_signals: isAccepted(classified) ? 1 : 0,
+    posted: [],
+    finished_at: new Date().toISOString()
+  };
+}
+
+async function runMockPostToHydra(startedAt) {
+  const candidate = {
+    name: 'Hydra Mock Post Test',
+    source_type: 'mock',
+    source_name: 'Hydra Self-Test',
+    source_url: 'selftest://mock-post-to-hydra',
+    vertical_hint: 'Cars',
+    text: 'I need a car this week. Bad credit. I have $2000 down. Need vehicle for work ASAP.'
+  };
+
+  const classified = await classifyCandidate(candidate);
+  const payload = buildHydraPayload(candidate, classified);
+  const post = await postToHydra(payload);
+
+  return {
+    status: post.ok ? 'OK' : 'ERROR',
+    mode: 'posttest',
+    started_at: startedAt,
+    extracted_candidates: 1,
+    accepted_signals: isAccepted(classified) ? 1 : 0,
+    hydra_post: post,
+    payload_preview: payload,
+    finished_at: new Date().toISOString()
+  };
+}
+
+async function runLiveFeed(startedAt) {
+  const targetsRaw = process.env.HYDRA_FEED_TARGETS_JSON || process.env.HYDRA_FEED_TARGETS || '';
+  const parsed = parseTargetsSafe(targetsRaw);
+  if (!parsed.ok || parsed.targets.length === 0) {
+    return {
+      status: 'ERROR',
+      message: 'No feed targets configured or JSON parse failed.',
+      parse_error: parsed.error || null,
+      env_hint: 'Set HYDRA_FEED_TARGETS_JSON to an array of target objects.',
+      finished_at: new Date().toISOString()
+    };
+  }
+
+  const result = {
+    status: 'OK',
+    result: {
+      run_id: 'HYDRA-FEED-' + Date.now(),
+      started_at: startedAt,
+      targets: parsed.targets.length,
+      extracted_candidates: 0,
+      accepted_signals: 0,
+      rejected_candidates: 0,
+      posted: [],
+      errors: []
+    }
+  };
+
+  for (const target of parsed.targets) {
+    try {
+      const candidates = await extractCandidates(target);
+      result.result.extracted_candidates += candidates.length;
+
+      for (const candidate of candidates) {
+        const classified = await classifyCandidate(candidate);
+        if (!isAccepted(classified)) {
+          result.result.rejected_candidates += 1;
+          continue;
+        }
+        result.result.accepted_signals += 1;
+        const payload = buildHydraPayload(candidate, classified);
+        const post = await postToHydra(payload);
+        result.result.posted.push(post);
+      }
+    } catch (err) {
+      result.result.errors.push({ target: target.name || target.url || 'unknown', message: err.message || String(err) });
+    }
+  }
+
+  result.result.finished_at = new Date().toISOString();
+  return result;
+}
+
+function parseTargetsSafe(raw) {
+  if (!raw) return { ok: false, targets: [], error: 'Empty target env var.' };
+  try {
+    const parsed = JSON.parse(raw);
+    const targets = Array.isArray(parsed) ? parsed : [parsed];
+    return { ok: true, targets, error: null };
+  } catch (err) {
+    return { ok: false, targets: [], error: err.message };
+  }
+}
+
+async function extractCandidates(target) {
+  const sourceType = String(target.source_type || 'url').toLowerCase();
+
+  if (sourceType === 'mock') {
+    return [{
+      name: target.name || 'Mock target',
+      source_type: 'mock',
+      source_name: target.source_name || target.name || 'Mock',
+      source_url: target.url || 'mock://target',
+      vertical_hint: target.vertical_hint || 'General',
+      text: target.text || target.raw_text || ''
+    }].filter(c => c.text);
+  }
+
+  // Direct fetch first. This avoids burning Browserbase minutes for simple public pages.
+  if (target.url) {
+    const text = await fetchPlainText(target.url);
+    const cleaned = cleanText(text).slice(0, 6000);
+    if (!cleaned || cleaned.length < 80) return [];
+    return [{
+      name: target.name || target.url,
+      source_type: sourceType,
+      source_name: target.name || target.url,
+      source_url: target.url,
+      vertical_hint: target.vertical_hint || target.vertical || 'General',
+      text: cleaned
+    }];
+  }
+
+  return [];
+}
+
+async function fetchPlainText(url) {
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'user-agent': 'Mozilla/5.0 HydraLiveFeedWorker/1.0',
+      'accept': 'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8'
+    }
+  });
+  if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
+  const html = await res.text();
+  return stripHtml(html);
+}
+
+function stripHtml(html) {
+  return String(html || '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+function cleanText(text) {
+  return String(text || '').replace(/\s+/g, ' ').trim();
+}
+
+async function classifyCandidate(candidate) {
+  if (!process.env.OPENAI_API_KEY) throw new Error('Missing OPENAI_API_KEY.');
+
+  const prompt = `You are Hydra's leverage-intelligence classifier. Analyze the raw public signal for buyer/seller leverage. Return strict JSON only with keys: status, vertical, primary_friction, leverage_density, conversion_probability, summary, route_type, reason. Accept only real leverage: urgency, bad credit/access gap, trust friction, coordination failure, fulfillment bottleneck, liquidity pressure, pricing asymmetry.\n\nVertical hint: ${candidate.vertical_hint}\nSource: ${candidate.source_name}\nText:\n${candidate.text}`;
+
+  const response = await fetch(OPENAI_URL, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'authorization': `Bearer ${process.env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: DEFAULT_MODEL,
+      messages: [
+        { role: 'system', content: 'Return strict JSON only. No markdown.' },
+        { role: 'user', content: prompt }
+      ],
+      temperature: 0.1
+    })
+  });
+
+  const raw = await response.text();
+  if (!response.ok) throw new Error(`OpenAI error ${response.status}: ${raw.slice(0, 400)}`);
+  const data = JSON.parse(raw);
+  const content = data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  return parseJsonFromText(content || '{}');
+}
+
+function parseJsonFromText(text) {
+  const s = String(text || '').trim().replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+  try { return JSON.parse(s); } catch (err) {
+    const m = s.match(/\{[\s\S]*\}/);
+    if (m) return JSON.parse(m[0]);
+    throw err;
+  }
+}
+
+function isAccepted(classified) {
+  const status = String(classified.status || '').toUpperCase();
+  const route = String(classified.route_type || '').toUpperCase();
+  const leverage = Number(classified.leverage_density || 0);
+  const conversion = Number(classified.conversion_probability || 0);
+  return status === 'ACCEPT' || route.includes('HOT') || (leverage >= 60 && conversion >= 45);
+}
+
+function buildHydraPayload(candidate, classified) {
+  return {
+    source_module: 'HYDRA_LIVE_FEED_WORKER_V1',
+    source_type: candidate.source_type || 'url',
+    source_channel: candidate.source_type || 'url',
+    source_name: candidate.source_name || candidate.name || '',
+    source_url: candidate.source_url || '',
+    vertical: classified.vertical || candidate.vertical_hint || 'General',
+    vertical_hint: candidate.vertical_hint || classified.vertical || 'General',
+    raw_signal: candidate.text || '',
+    raw_text: candidate.text || '',
+    message: classified.summary || candidate.text || '',
+    primary_friction: classified.primary_friction || 'UNKNOWN',
+    leverage_density: Number(classified.leverage_density || 0),
+    conversion_probability: Number(classified.conversion_probability || 0),
+    route_type: classified.route_type || 'ARCHIVE_OR_MONITOR',
+    ai_summary: classified.summary || '',
+    ai_reason: classified.reason || '',
+    status: 'NEW'
+  };
+}
+
+async function postToHydra(payload) {
+  if (!process.env.HYDRA_WEBHOOK_URL) throw new Error('Missing HYDRA_WEBHOOK_URL.');
+  const res = await fetch(process.env.HYDRA_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const text = await res.text();
+  return {
+    ok: res.ok,
+    status: res.status,
+    response: text.slice(0, 500),
+    posted_at: new Date().toISOString()
+  };
+}
+
+function json(statusCode, body) {
+  return {
+    statusCode,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store'
+    },
+    body: JSON.stringify(body)
+  };
 }

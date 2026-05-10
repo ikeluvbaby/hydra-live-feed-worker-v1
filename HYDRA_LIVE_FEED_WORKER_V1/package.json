@@ -1,15 +1,11 @@
 {
   "name": "hydra-live-feed-worker-v1",
-  "version": "1.2.0-netlify-cjs",
-  "private": true,
-  "scripts": {
-    "start:local": "node netlify/functions/hydra-live-feed-worker.js --once",
-    "test:config": "node netlify/functions/hydra-live-feed-worker.js --config-check"
+  "version": "1.0.2",
+  "description": "Hydra Live Feed Worker V1 Netlify self-test safe build",
+  "main": "netlify/functions/hydra-live-feed-worker.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
   },
-  "dependencies": {
-    "@browserbasehq/sdk": "^2.0.0",
-    "openai": "^6.0.0",
-    "playwright-core": "^1.49.0"
-  },
-  "devDependencies": {}
+  "dependencies": {}
 }
